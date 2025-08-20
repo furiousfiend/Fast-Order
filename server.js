@@ -22,24 +22,29 @@ const PORT = process.env.PORT || 3000;
 let tokens = null;
 let realmId = process.env.QB_REALM_ID || null;
 
+const envSetting = (process.env.QB_ENVIRONMENT || 'sandbox').toLowerCase();
+const useSandbox = envSetting !== 'production'; // ✅ correct: sandbox unless explicitly "production"
+
 const oauthClient = new OAuthClient({
   clientId: process.env.QB_CLIENT_ID,
   clientSecret: process.env.QB_CLIENT_SECRET,
-  environment: process.env.QB_ENVIRONMENT || 'sandbox',
+  environment: envSetting, // 'sandbox' or 'production'
   redirectUri: process.env.QB_REDIRECT_URI
 });
 
-function getQB(){
-  if(!tokens || !realmId){
+function getQB() {
+  if (!tokens || !realmId) {
     throw new Error('Not connected to QuickBooks yet. Visit /auth/connect first.');
   }
+  // node-quickbooks args (OAuth2):
+  // (clientId, clientSecret, accessToken, false, realmId, useSandbox, debug, minorversion, oauth_version, refreshToken)
   return new QuickBooks(
     process.env.QB_CLIENT_ID,
     process.env.QB_CLIENT_SECRET,
     tokens.access_token,
     false,
     realmId,
-    process.env.QB_ENVIRONMENT === 'production',
+    useSandbox,
     true,
     null,
     '2.0',
@@ -58,40 +63,43 @@ app.get('/auth/connect', (req, res) => {
 
 // --- OAuth callback
 app.get('/auth/callback', async (req, res) => {
-  try{
+  try {
     const authResponse = await oauthClient.createToken(req.url);
     tokens = authResponse.getJson();
     realmId = req.query.realmId || realmId;
     res.send(`<h3>Connected to QuickBooks ✅</h3>
       <p>Realm ID: ${realmId || '(missing)'}</p>
       <p><a href="/">Go to the order form</a></p>`);
-  }catch(e){
+  } catch (e) {
     res.status(500).send('OAuth error: ' + e.message);
   }
 });
 
-// --- Search Items (autocomplete)  ➜ returns name, sku, unitPrice, qtyOnHand
+// --- Search Items (autocomplete) — SQL LIKE, returns price + qtyOnHand
 app.get('/api/items', (req, res) => {
   try {
-    const q = (req.query.q || '').trim();
+    const q = String(req.query.q || '').trim();
     const qb = getQB();
 
-    // Limit to active items; Name filter is “contains”
-    const search = {};
-    if (q) search.Name = q;
-    search.Active = true;
+    // escape single quotes for SQL
+    const term = q.replace(/'/g, "''");
+    let sql = `
+      SELECT Id, Name, Sku, Type, UnitPrice, QtyOnHand
+      FROM Item
+      WHERE Active = true
+    `;
+    if (term) sql += ` AND Name LIKE '%${term}%'`;
+    sql += ` MAXRESULTS 25`;
 
-    qb.findItems(search, (err, data) => {
-      if (err) {
-        return res.status(500).json({ error: 'QuickBooks item lookup failed', details: err.Fault || err });
-      }
+    qb.query(sql, (err, data) => {
+      if (err) return res.status(500).json({ error: 'QuickBooks item lookup failed', details: err.Fault || err });
       const items = (data?.QueryResponse?.Item || []).map(it => ({
         id: it.Id,
         name: it.Name,
         sku: it.Sku,
         unitPrice: it.UnitPrice,
         type: it.Type,
-        qtyOnHand: (typeof it.QtyOnHand === 'number' ? it.QtyOnHand : null) // Inventory items only
+        qtyOnHand: typeof it.QtyOnHand === 'number' ? it.QtyOnHand : null
       }));
       res.json({ items });
     });
@@ -100,21 +108,26 @@ app.get('/api/items', (req, res) => {
   }
 });
 
-// --- Search Customers (autocomplete)
+// --- Search Customers (autocomplete) — SQL LIKE on DisplayName
 app.get('/api/customers', (req, res) => {
   try {
-    const q = (req.query.q || '').trim();
+    const q = String(req.query.q || '').trim();
     const qb = getQB();
-    const search = {};
-    if (q) search.DisplayName = q;
 
-    qb.findCustomers(search, (err, data) => {
-      if (err) {
-        return res.status(500).json({ error: 'QuickBooks customer lookup failed', details: err.Fault || err });
-      }
+    const term = q.replace(/'/g, "''");
+    let sql = `
+      SELECT Id, DisplayName, PrimaryEmailAddr
+      FROM Customer
+      WHERE Active = true
+    `;
+    if (term) sql += ` AND DisplayName LIKE '%${term}%'`;
+    sql += ` MAXRESULTS 25`;
+
+    qb.query(sql, (err, data) => {
+      if (err) return res.status(500).json({ error: 'QuickBooks customer lookup failed', details: err.Fault || err });
       const customers = (data?.QueryResponse?.Customer || []).map(c => ({
         id: c.Id,
-        name: c.DisplayName || `${c.GivenName || ''} ${c.FamilyName || ''}`.trim(),
+        name: c.DisplayName,
         email: c.PrimaryEmailAddr?.Address || null
       }));
       res.json({ customers });
@@ -125,16 +138,15 @@ app.get('/api/customers', (req, res) => {
 });
 
 // --- Create UNSENT invoice (draft-like)
-// - Price auto-generates from selected item (passed from UI)
-// - Qty must be whole number (validated on server too)
-// - Agent name goes to CustomField "Agent" if available, and into PrivateNote as a fallback
-app.post('/api/invoice', (req,res)=>{
-  try{
+// - Price auto-generates (from item; front-end passes it)
+// - Qty must be whole number (server-enforced)
+// - Agent name stored in CustomField "Agent" if available, also in PrivateNote
+app.post('/api/invoice', (req, res) => {
+  try {
     const { customerId, notes, agentName, lines } = req.body;
-    if(!customerId) return res.status(400).json({ error: 'customerId required' });
-    if(!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'lines required' });
+    if (!customerId) return res.status(400).json({ error: 'customerId required' });
+    if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'lines required' });
 
-    // Sanitize/validate lines: ensure integer qty >= 1
     const cleanLines = lines.map(l => {
       const qty = Math.max(1, Math.floor(Number(l.qty || 1)));
       const price = Number(l.unitPrice || 0);
@@ -159,33 +171,27 @@ app.post('/api/invoice', (req,res)=>{
       EmailStatus: 'NotSet'
     };
 
-    // Try to set custom field "Agent" if company has it configured
     if (agentName) {
       invoice.CustomField = [
-        {
-          DefinitionId: '1',      // common default; will be ignored if not configured
-          Name: 'Agent',
-          Type: 'StringType',
-          StringValue: agentName
-        }
+        { DefinitionId: '1', Name: 'Agent', Type: 'StringType', StringValue: agentName }
       ];
     }
 
     qb.createInvoice(invoice, (err, created) => {
-      if(err) return res.status(500).json({ error: 'Failed to create invoice', details: err.Fault || err });
-      res.json({ ok:true, invoice: { Id: created.Id, DocNumber: created.DocNumber, TotalAmt: created.TotalAmt } });
+      if (err) return res.status(500).json({ error: 'Failed to create invoice', details: err.Fault || err });
+      res.json({ ok: true, invoice: { Id: created.Id, DocNumber: created.DocNumber, TotalAmt: created.TotalAmt } });
     });
-  }catch(e){
+  } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
 // --- Create Estimate (alternative draft)
-app.post('/api/estimate', (req,res)=>{
-  try{
+app.post('/api/estimate', (req, res) => {
+  try {
     const { customerId, notes, agentName, lines } = req.body;
-    if(!customerId) return res.status(400).json({ error: 'customerId required' });
-    if(!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'lines required' });
+    if (!customerId) return res.status(400).json({ error: 'customerId required' });
+    if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'lines required' });
 
     const cleanLines = lines.map(l => {
       const qty = Math.max(1, Math.floor(Number(l.qty || 1)));
@@ -215,17 +221,17 @@ app.post('/api/estimate', (req,res)=>{
     }
 
     qb.createEstimate(estimate, (err, created) => {
-      if(err) return res.status(500).json({ error: 'Failed to create estimate', details: err.Fault || err });
-      res.json({ ok:true, estimate: { Id: created.Id, DocNumber: created.DocNumber, TotalAmt: created.TotalAmt } });
+      if (err) return res.status(500).json({ error: 'Failed to create estimate', details: err.Fault || err });
+      res.json({ ok: true, estimate: { Id: created.Id, DocNumber: created.DocNumber, TotalAmt: created.TotalAmt } });
     });
-  }catch(e){
+  } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
 // --- Serve the UI
-app.get('*', (req,res)=>{
+app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, ()=> console.log(`QuickBooks order prototype → http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`QuickBooks order prototype → http://localhost:${PORT}`));
