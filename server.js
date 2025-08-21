@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import OAuthClient from 'intuit-oauth';
 import QuickBooks from 'node-quickbooks';
+import fetch from 'node-fetch'; // new: used to call QuickBooks API
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -23,7 +24,10 @@ let tokens = null;
 let realmId = process.env.QB_REALM_ID || null;
 
 const envSetting = (process.env.QB_ENVIRONMENT || 'sandbox').toLowerCase();
-const useSandbox = envSetting !== 'production'; // ✅ correct: sandbox unless explicitly "production"
+const useSandbox = envSetting !== 'production'; // sandbox by default
+
+// new: base URL for QuickBooks Online queries
+const QBO_BASE = process.env.QBO_BASE || 'https://sandbox-quickbooks.api.intuit.com';
 
 const oauthClient = new OAuthClient({
   clientId: process.env.QB_CLIENT_ID,
@@ -37,7 +41,6 @@ function getQB() {
     throw new Error('Not connected to QuickBooks yet. Visit /auth/connect first.');
   }
   // node-quickbooks args (OAuth2):
-  // (clientId, clientSecret, accessToken, false, realmId, useSandbox, debug, minorversion, oauth_version, refreshToken)
   return new QuickBooks(
     process.env.QB_CLIENT_ID,
     process.env.QB_CLIENT_SECRET,
@@ -75,75 +78,84 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
-// --- Search Items (autocomplete) — SQL LIKE, returns price + qtyOnHand
-app.get('/api/items', (req, res) => {
+// --- Search Items (autocomplete) — searches by Name or Sku
+app.get('/api/items', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
-    const qb = getQB();
-
-    // escape single quotes for SQL
-    const term = q.replace(/'/g, "''");
+    const term = q.replace(/'/g, "''"); // escape single quotes for SQL
     let sql = `
       SELECT Id, Name, Sku, Type, UnitPrice, QtyOnHand
       FROM Item
       WHERE Active = true
     `;
-    if (term) sql += ` AND Name LIKE '%${term}%'`;
-    sql += ` MAXRESULTS 25`;
+    if (term) {
+      sql += ` AND (Name LIKE '%${term}%' OR Sku LIKE '%${term}%')`;
+    }
+    sql += ` STARTPOSITION 1 MAXRESULTS 25`;
 
-    qb.query(sql, (err, data) => {
-      if (err) return res.status(500).json({ error: 'QuickBooks item lookup failed', details: err.Fault || err });
-      const items = (data?.QueryResponse?.Item || []).map(it => ({
-        id: it.Id,
-        name: it.Name,
-        sku: it.Sku,
-        unitPrice: it.UnitPrice,
-        type: it.Type,
-        qtyOnHand: typeof it.QtyOnHand === 'number' ? it.QtyOnHand : null
-      }));
-      res.json({ items });
+    const url = `${QBO_BASE}/v3/company/${realmId}/query?minorversion=73`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${tokens.access_token}`,
+        'Content-Type': 'application/text',
+        Accept: 'application/json'
+      },
+      body: sql
     });
+    const data = await response.json();
+    const items = (data?.QueryResponse?.Item || []).map(it => ({
+      id: it.Id,
+      name: it.Name,
+      sku: it.Sku,
+      unitPrice: it.UnitPrice,
+      type: it.Type,
+      qtyOnHand: typeof it.QtyOnHand === 'number' ? it.QtyOnHand : null
+    }));
+    res.json({ items });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// --- Search Customers (autocomplete) — SQL LIKE on DisplayName
-app.get('/api/customers', (req, res) => {
+// --- Search Customers (autocomplete) — searches DisplayName, CompanyName and PrimaryEmailAddr
+app.get('/api/customers', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
-    const qb = getQB();
-
     const term = q.replace(/'/g, "''");
     let sql = `
-      SELECT Id, DisplayName, PrimaryEmailAddr
+      SELECT Id, DisplayName, CompanyName, PrimaryEmailAddr
       FROM Customer
       WHERE Active = true
     `;
-    if (term) sql += ` AND DisplayName LIKE '%${term}%'`;
     if (term) {
-  sql += ` AND (DisplayName LIKE '%${term}%' OR CompanyName LIKE '%${term}%' OR PrimaryEmailAddr LIKE '%${term}%')`;
-}
+      sql += ` AND (DisplayName LIKE '%${term}%' OR CompanyName LIKE '%${term}%' OR PrimaryEmailAddr LIKE '%${term}%')`;
+    }
+    sql += ` STARTPOSITION 1 MAXRESULTS 25`;
 
-
-    qb.query(sql, (err, data) => {
-      if (err) return res.status(500).json({ error: 'QuickBooks customer lookup failed', details: err.Fault || err });
-      const customers = (data?.QueryResponse?.Customer || []).map(c => ({
-        id: c.Id,
-        name: c.DisplayName,
-        email: c.PrimaryEmailAddr?.Address || null
-      }));
-      res.json({ customers });
+    const url = `${QBO_BASE}/v3/company/${realmId}/query?minorversion=73`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${tokens.access_token}`,
+        'Content-Type': 'application/text',
+        Accept: 'application/json'
+      },
+      body: sql
     });
+    const data = await response.json();
+    const customers = (data?.QueryResponse?.Customer || []).map(c => ({
+      id: c.Id,
+      name: c.DisplayName || c.CompanyName || '',
+      email: c.PrimaryEmailAddr?.Address || null
+    }));
+    res.json({ customers });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
 // --- Create UNSENT invoice (draft-like)
-// - Price auto-generates (from item; front-end passes it)
-// - Qty must be whole number (server-enforced)
-// - Agent name stored in CustomField "Agent" if available, also in PrivateNote
 app.post('/api/invoice', (req, res) => {
   try {
     const { customerId, notes, agentName, lines } = req.body;
@@ -166,20 +178,17 @@ app.post('/api/invoice', (req, res) => {
     });
 
     const qb = getQB();
-
     const invoice = {
       CustomerRef: { value: String(customerId) },
       PrivateNote: `${agentName ? `Agent: ${agentName} — ` : ''}${notes || ''}`.trim(),
       Line: cleanLines,
       EmailStatus: 'NotSet'
     };
-
     if (agentName) {
       invoice.CustomField = [
         { DefinitionId: '1', Name: 'Agent', Type: 'StringType', StringValue: agentName }
       ];
     }
-
     qb.createInvoice(invoice, (err, created) => {
       if (err) return res.status(500).json({ error: 'Failed to create invoice', details: err.Fault || err });
       res.json({ ok: true, invoice: { Id: created.Id, DocNumber: created.DocNumber, TotalAmt: created.TotalAmt } });
@@ -222,7 +231,6 @@ app.post('/api/estimate', (req, res) => {
         { DefinitionId: '1', Name: 'Agent', Type: 'StringType', StringValue: agentName }
       ];
     }
-
     qb.createEstimate(estimate, (err, created) => {
       if (err) return res.status(500).json({ error: 'Failed to create estimate', details: err.Fault || err });
       res.json({ ok: true, estimate: { Id: created.Id, DocNumber: created.DocNumber, TotalAmt: created.TotalAmt } });
@@ -238,4 +246,3 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`QuickBooks order prototype → http://localhost:${PORT}`));
-
