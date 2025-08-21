@@ -121,7 +121,10 @@ app.get('/api/customers', (req, res) => {
       WHERE Active = true
     `;
     if (term) sql += ` AND DisplayName LIKE '%${term}%'`;
-    sql += ` MAXRESULTS 25`;
+    if (term) {
+  sql += ` AND (DisplayName LIKE '%${term}%' OR CompanyName LIKE '%${term}%' OR PrimaryEmailAddr LIKE '%${term}%')`;
+}
+
 
     qb.query(sql, (err, data) => {
       if (err) return res.status(500).json({ error: 'QuickBooks customer lookup failed', details: err.Fault || err });
@@ -235,3 +238,4 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`QuickBooks order prototype → http://localhost:${PORT}`));
+
