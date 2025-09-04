@@ -212,14 +212,17 @@ app.post('/api/estimate', (req, res) => {
   }
 });
 
-// --- Serve ingest page explicitly
+// Home → ingest
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'ingest.html'));
+});
+
+// Keep a direct route too (optional)
 app.get('/ingest', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'ingest.html'));
 });
 
-// --- Serve default UI
+// Fallback: anything else → old index (optional)
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
-
-app.listen(PORT, () => console.log(`QuickBooks order prototype → http://localhost:${PORT}`));
