@@ -1,0 +1,286 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fast Order → QuickBooks (Draft)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif;line-height:1.4;background:#fafafa;color:#111;margin:0}
+    .wrap{max-width:900px;margin:0 auto;padding:16px}
+    header{position:sticky;top:0;background:#fff;border-bottom:1px solid #eee;padding:12px 0;z-index:10}
+    h1{font-size:18px;margin:0}
+    .card{background:#fff;border:1px solid #eee;border-radius:16px;box-shadow:0 4px 18px rgba(0,0,0,.04);padding:16px;margin:16px 0}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    label{font-size:12px;text-transform:uppercase;color:#6b7280;margin-bottom:4px;display:block}
+    input,button{width:100%;padding:12px;border:1px solid #d1d5db;border-radius:12px;outline:none}
+    input:focus{border-color:#111;box-shadow:0 0 0 3px rgba(0,0,0,.08)}
+    button{background:#111;color:#fff;cursor:pointer}
+    button.secondary{background:#fff;color:#111;border:1px solid #111}
+    .line{display:grid;grid-template-columns:6fr 2fr 2fr auto;gap:8px;align-items:end;margin-bottom:10px}
+    .dropdown{position:relative}
+    .panel{position:absolute;left:0;right:0;background:#fff;border:1px solid #e5e7eb;border-radius:12px;max-height:240px;overflow:auto;z-index:20}
+    .item{padding:8px 10px;cursor:pointer}
+    .item:hover{background:#f3f4f6}
+    .meta{font-size:12px;color:#6b7280}
+    .pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:8px}
+    .pill.green{background:#10b981;color:#fff}
+    .pill.red{background:#ef4444;color:#fff}
+    .footer{font-size:12px;color:#6b7280}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header><h1>Fast Order → QuickBooks</h1></header>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Customer (type to search)</label>
+          <div class="dropdown">
+            <input id="customerInput" placeholder="Start typing customer name…" autocomplete="off">
+            <div id="customerPanel" class="panel" style="display:none;"></div>
+          </div>
+          <input id="customerId" type="hidden">
+        </div>
+        <div>
+          <label>Agent name</label>
+          <input id="agentName" placeholder="e.g. Aoife / Ben">
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div>
+          <label>Notes (optional)</label>
+          <input id="notes" placeholder="PO number, delivery notes…">
+        </div>
+        <div>
+          <label>Draft type</label>
+          <select id="draftType">
+            <option value="invoice">Unsent Invoice</option>
+            <option value="estimate">Estimate</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div id="lines" class="card">
+      <!-- one line template -->
+      <div class="line">
+        <div class="dropdown">
+          <label>Product</label>
+          <input class="productInput" placeholder="Start typing product name…" autocomplete="off">
+          <div class="panel" style="display:none;"></div>
+        </div>
+        <div>
+          <label>Qty</label>
+          <input class="qtyInput" type="number" min="1" step="1" value="1">
+        </div>
+        <div>
+          <label>Unit Price</label>
+          <input class="priceInput" type="number" min="0" step="0.01" readonly title="Auto from QuickBooks">
+        </div>
+        <div><button class="remove secondary" title="Remove line">−</button></div>
+      </div>
+    </div>
+
+    <div class="card actions">
+      <button id="addLine" class="secondary">+ Add line</button>
+      <button id="submitBtn">Create Draft</button>
+      <span id="status" class="footer"></span>
+    </div>
+
+    <div class="card footer">
+      • Product & customer both autocomplete from QuickBooks • Price auto-fills • Qty must be a whole number (min 1) • Availability bubble turns <b>green</b> when in stock, <b>red</b> if requested > stock
+    </div>
+  </div>
+
+  <script>
+    // ===== Customer autocomplete =====
+    (function(){
+      const input = document.getElementById('customerInput');
+      const panel = document.getElementById('customerPanel');
+      const hiddenId = document.getElementById('customerId');
+
+      async function search(q){
+        const res = await fetch('/api/customers?q=' + encodeURIComponent(q || ''));
+        if(!res.ok) return [];
+        const data = await res.json();
+        return data.customers || [];
+      }
+      function show(items){
+        panel.innerHTML = '';
+        if(!items.length){ panel.style.display = 'none'; return; }
+        items.slice(0,15).forEach(c => {
+          const d = document.createElement('div');
+          d.className = 'item';
+          d.innerHTML = '<strong>' + escapeHtml(c.name || '(no name)') + '</strong>' +
+                        (c.email ? ' <span class="meta">• ' + escapeHtml(c.email) + '</span>' : '');
+          d.addEventListener('click', ()=>{
+            input.value = c.name;
+            hiddenId.value = c.id;
+            panel.style.display = 'none';
+          });
+          panel.appendChild(d);
+        });
+        panel.style.display = 'block';
+      }
+      async function update(){ show(await search(input.value)); }
+      input.addEventListener('input', update);
+      input.addEventListener('focus', update);
+      document.addEventListener('click', (e)=>{ if(!panel.contains(e.target) && e.target !== input){ panel.style.display='none'; } });
+    })();
+
+    // ===== Product lines =====
+    const STRIP_PREFIXES = ["cramer"]; // display-only: hide first word
+    function stripPrefix(title){
+      const parts = (title||'').trim().split(/\s+/);
+      if(parts.length && STRIP_PREFIXES.includes(parts[0].toLowerCase())) return parts.slice(1).join(' ');
+      return title;
+    }
+    function escapeHtml(s){ return (s||'').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\\'':'&#39;'}[c])); }
+
+    function wireLine(lineEl){
+      const input = lineEl.querySelector('.productInput');
+      const panel = lineEl.querySelector('.panel');
+      const qtyEl = lineEl.querySelector('.qtyInput');
+      const priceEl = lineEl.querySelector('.priceInput');
+      let selected = null; // {id, name, unitPrice, qtyOnHand}
+
+      function stockPill(qtyOnHand, wanted){
+        const pill = document.createElement('span');
+        const ok = typeof qtyOnHand === 'number' && wanted <= qtyOnHand;
+        pill.className = 'pill ' + (ok ? 'green' : 'red');
+        if (typeof qtyOnHand !== 'number') {
+          pill.textContent = 'No stock tracking';
+        } else {
+          pill.textContent = `${qtyOnHand} in stock`;
+        }
+        return pill;
+      }
+
+      async function search(q){
+        const res = await fetch('/api/items?q=' + encodeURIComponent(q || ''));
+        if(!res.ok) return [];
+        const data = await res.json();
+        return data.items || [];
+      }
+
+      function show(items){
+        panel.innerHTML = '';
+        if(!items.length){ panel.style.display = 'none'; return; }
+        items.slice(0,15).forEach(p => {
+          const d = document.createElement('div');
+          d.className = 'item';
+          d.innerHTML =
+            '<strong>' + escapeHtml(stripPrefix(p.name)) + '</strong>' +
+            (p.sku ? ' <span class="meta">SKU ' + escapeHtml(p.sku) + '</span>' : '') +
+            (p.unitPrice != null ? ' <span class="meta">£' + Number(p.unitPrice).toFixed(2) + '</span>' : '');
+          d.addEventListener('click', ()=>{
+            selected = p;
+            input.value = p.name;                 // keep full title under the hood
+            priceEl.value = (p.unitPrice != null ? Number(p.unitPrice).toFixed(2) : '');
+            panel.style.display = 'none';
+            reflectAvailability();
+          });
+          panel.appendChild(d);
+        });
+        panel.style.display = 'block';
+      }
+
+      function reflectAvailability(){
+        // Remove existing pills from the product cell label (render fresh below input)
+        let existing = lineEl.querySelector('.stock-pill-holder');
+        if (existing) existing.remove();
+
+        const holder = document.createElement('div');
+        holder.className = 'stock-pill-holder';
+        holder.style.marginTop = '6px';
+        if (selected) {
+          const wanted = Math.max(1, Math.floor(Number(qtyEl.value || 1)));
+          holder.appendChild(stockPill(selected.qtyOnHand, wanted));
+        }
+        // Insert just after the product input
+        input.parentElement.appendChild(holder);
+      }
+
+      async function update(){ show(await search(input.value)); }
+      input.addEventListener('input', update);
+      input.addEventListener('focus', update);
+      document.addEventListener('click', (e)=>{ if(!panel.contains(e.target) && e.target!==input){ panel.style.display='none'; } });
+
+      // Qty rules: whole numbers only, min 1
+      qtyEl.addEventListener('input', ()=>{
+        const n = Math.max(1, Math.floor(Number(qtyEl.value || 1)));
+        qtyEl.value = String(n);
+        reflectAvailability();
+      });
+
+      // remove
+      lineEl.querySelector('.remove').addEventListener('click', (e)=>{
+        e.preventDefault();
+        const all = document.querySelectorAll('#lines .line');
+        if(all.length > 1) lineEl.remove();
+      });
+
+      // expose getter for submission
+      lineEl.getValue = () => ({
+        itemId: selected?.id,
+        description: selected?.name || input.value,
+        qty: Math.max(1, Math.floor(Number(qtyEl.value || 1))),
+        unitPrice: Number(priceEl.value || 0)
+      });
+    }
+
+    // init first line + add more
+    wireLine(document.querySelector('.line'));
+    document.getElementById('addLine').addEventListener('click', (e)=>{
+      e.preventDefault();
+      const clone = document.querySelector('.line').cloneNode(true);
+      clone.querySelector('.productInput').value = '';
+      clone.querySelector('.qtyInput').value = '1';
+      clone.querySelector('.priceInput').value = '';
+      clone.querySelector('.panel').style.display='none';
+      const oldPill = clone.querySelector('.stock-pill-holder');
+      if (oldPill) oldPill.remove();
+      document.getElementById('lines').appendChild(clone);
+      wireLine(clone);
+    });
+
+    // Submit handler
+    document.getElementById('submitBtn').addEventListener('click', async ()=>{
+      const status = document.getElementById('status');
+      status.textContent = 'Submitting…';
+
+      const customerId = document.getElementById('customerId').value.trim();
+      if(!customerId){ alert('Please choose a customer from the list.'); status.textContent=''; return; }
+
+      const agentName = document.getElementById('agentName').value.trim();
+      const notes = document.getElementById('notes').value.trim();
+      const draftType = document.getElementById('draftType').value;
+
+      const lines = Array.from(document.querySelectorAll('#lines .line'))
+        .map(el => el.getValue())
+        .filter(l => l.itemId && l.qty >= 1);
+
+      if(!lines.length){ alert('Add at least one product line.'); status.textContent=''; return; }
+
+      const endpoint = draftType === 'estimate' ? '/api/estimate' : '/api/invoice';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ customerId, notes, agentName, lines })
+      });
+      const data = await res.json();
+      if(res.ok){
+        status.textContent = draftType === 'estimate'
+          ? `Estimate created ✓ (ID ${data.estimate.Id || data.estimate.id})`
+          : `Invoice created (unsent) ✓ (ID ${data.invoice.Id || data.invoice.id})`;
+      }else{
+        alert('Error: ' + (data.error || 'Unknown error'));
+        status.textContent = 'Error';
+        console.error(data);
+      }
+    });
+  </script>
+</body>
+</html>

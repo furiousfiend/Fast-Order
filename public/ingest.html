@@ -1,0 +1,323 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fast Order – Ingest</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial;background:#fafafa;color:#111;margin:0}
+    .wrap{max-width:820px;margin:0 auto;padding:16px}
+    h1{font-size:18px;margin:8px 0 4px}
+    .card{background:#fff;border:1px solid #eee;border-radius:16px;box-shadow:0 4px 18px rgba(0,0,0,.04);padding:16px;margin:12px 0}
+    label{font-size:12px;color:#6b7280;text-transform:uppercase;margin-bottom:6px;display:block}
+    textarea,input,button,select{width:100%;padding:12px;border:1px solid #d1d5db;border-radius:12px}
+    textarea{min-height:120px}
+    button{background:#111;color:#fff;cursor:pointer}
+    button.secondary{background:#fff;color:#111;border:1px solid #111}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .line{display:grid;grid-template-columns:5fr 2fr 2fr auto;gap:8px;align-items:end;margin-bottom:8px}
+    .dropdown{position:relative}
+    .panel{position:absolute;left:0;right:0;background:#fff;border:1px solid #e5e7eb;border-radius:12px;max-height:220px;overflow:auto;z-index:20}
+    .item{padding:8px 10px;cursor:pointer}
+    .item:hover{background:#f3f4f6}
+    .meta{font-size:12px;color:#6b7280}
+    .hint{font-size:12px;color:#6b7280}
+    .pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:8px}
+    .pill.green{background:#10b981;color:#fff}
+    .pill.red{background:#ef4444;color:#fff}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Fast Order – Paste & Parse</h1>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Customer (just once)</label>
+        <div class="dropdown">
+          <input id="customerInput" placeholder="Type to search customer…" autocomplete="off">
+          <div id="customerPanel" class="panel" style="display:none;"></div>
+        </div>
+        <input id="customerId" type="hidden">
+        <div class="hint">Required by QuickBooks; set once and it’s remembered on this device.</div>
+      </div>
+      <div>
+        <label>Agent (optional)</label>
+        <input id="agentName" placeholder="Your name (saved on this device)">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Paste order text</label>
+    <textarea id="paste" placeholder="Example:
+blue shampoo 250 x 3
+silver mask 2
+developer 6% 1
+"></textarea>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button id="parseBtn" class="secondary">Parse</button>
+      <button id="clearBtn" class="secondary">Clear</button>
+    </div>
+    <div class="hint" style="margin-top:6px">Understands “x3”, “3x”, “qty 3”, or a trailing number (e.g. “silver mask 2”).</div>
+  </div>
+
+  <div id="linesCard" class="card" style="display:none">
+    <label>Lines</label>
+    <div id="lines"></div>
+    <div class="hint">If a product is uncertain, pick from the dropdown and click “Teach” to remember it next time.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Draft type</label>
+        <select id="draftType">
+          <option value="invoice">Unsent Invoice</option>
+          <option value="estimate">Estimate</option>
+        </select>
+      </div>
+      <div>
+        <label>Notes (optional)</label>
+        <input id="notes" placeholder="PO number, delivery notes…">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button id="submitBtn">Create Draft</button>
+      <button id="exportAliases" class="secondary">Export teaches</button>
+      <button id="importAliases" class="secondary">Import teaches</button>
+      <input id="importFile" type="file" accept="application/json" style="display:none">
+      <span id="status" class="hint" style="margin-left:8px"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = ""; // same origin
+const STRIP_PREFIXES = ["cramer"];
+const stripPrefix = t => {const p=(t||'').trim().split(/\s+/);return p.length && STRIP_PREFIXES.includes(p[0].toLowerCase()) ? p.slice(1).join(' ') : t;};
+const escapeHtml = s => (s||'').replace(/[&<>\"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\'':'&#39;'}[c]));
+const aliasesKey='fastorder_aliases_v1';
+const settingsKey='fastorder_settings_v1';
+
+function loadAliases(){ try{ return JSON.parse(localStorage.getItem(aliasesKey)||'{}'); }catch{ return {}; } }
+function saveAliases(map){ localStorage.setItem(aliasesKey, JSON.stringify(map)); }
+function loadSettings(){ try{ return JSON.parse(localStorage.getItem(settingsKey)||'{}'); }catch{ return {}; } }
+function saveSettings(s){ localStorage.setItem(settingsKey, JSON.stringify(s)); }
+
+let aliases = loadAliases();
+let settings = loadSettings();
+
+document.getElementById('agentName').value = settings.agentName || '';
+if(settings.customerId && settings.customerName){
+  document.getElementById('customerId').value = settings.customerId;
+  document.getElementById('customerInput').value = settings.customerName;
+}
+
+// customer autocomplete (once)
+(function(){
+  const input = document.getElementById('customerInput');
+  const panel = document.getElementById('customerPanel');
+  const hiddenId = document.getElementById('customerId');
+  async function search(q){ const r=await fetch(API + '/api/customers?q='+encodeURIComponent(q||'')); if(!r.ok) return []; const d=await r.json(); return d.customers||[]; }
+  function show(items){
+    panel.innerHTML=''; if(!items.length){ panel.style.display='none'; return; }
+    items.slice(0,20).forEach(c=>{
+      const d=document.createElement('div'); d.className='item';
+      d.innerHTML='<strong>'+escapeHtml(c.name||'(no name)')+'</strong>'+(c.email?' <span class="meta">• '+escapeHtml(c.email)+'</span>':'');
+      d.onclick=()=>{ input.value=c.name; hiddenId.value=c.id; panel.style.display='none'; settings.customerId=c.id; settings.customerName=c.name; saveSettings(settings); };
+      panel.appendChild(d);
+    });
+    panel.style.display='block';
+  }
+  async function update(){ show(await search(input.value)); }
+  input.addEventListener('input', update);
+  input.addEventListener('focus', update);
+  document.addEventListener('click', (e)=>{ if(!panel.contains(e.target) && e.target!==input){ panel.style.display='none'; } });
+})();
+
+// parse pasted text into {phrase, qty}
+function parseLines(txt){
+  return txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean).map(line=>{
+    let qty=1, phrase=line; let m;
+    if((m=line.match(/x\s*(\d+)$/i))) { qty=+m[1]; phrase=line.replace(/x\s*\d+$/i,'').trim(); }
+    else if((m=line.match(/^(\d+)\s*x/i))) { qty=+m[1]; phrase=line.replace(/^\d+\s*x/i,'').trim(); }
+    else if((m=line.match(/qty\s*(\d+)/i))) { qty=+m[1]; phrase=line.replace(/qty\s*\d+/i,'').trim(); }
+    else if((m=line.match(/(\d+)\s*$/))) { qty=+m[1]; phrase=line.replace(/\d+\s*$/,'').trim(); }
+    qty = Math.max(1, Math.floor(qty||1));
+    return { phrase, qty };
+  });
+}
+
+function newLineRow({phrase, qty}){
+  const row = document.createElement('div');
+  row.className='line';
+  row.innerHTML = `
+    <div class="dropdown">
+      <label>Product</label>
+      <input class="productInput" value="${escapeHtml(phrase)}" autocomplete="off">
+      <div class="panel" style="display:none;"></div>
+      <div class="hint"></div>
+    </div>
+    <div>
+      <label>Qty</label>
+      <input class="qtyInput" type="number" min="1" step="1" value="${qty}">
+    </div>
+    <div>
+      <label>Unit Price</label>
+      <input class="priceInput" type="number" min="0" step="0.01" readonly>
+    </div>
+    <div style="display:flex;gap:6px">
+      <button class="teach secondary" title="Remember mapping">Teach</button>
+      <button class="remove secondary" title="Remove">−</button>
+    </div>
+  `;
+  wireLine(row);
+  return row;
+}
+
+function wireLine(lineEl){
+  const input=lineEl.querySelector('.productInput');
+  const panel=lineEl.querySelector('.panel');
+  const qtyEl=lineEl.querySelector('.qtyInput');
+  const priceEl=lineEl.querySelector('.priceInput');
+  const hint=lineEl.querySelector('.hint');
+  let selected=null;
+
+  function stockPill(qtyOnHand,wanted){
+    const el=document.createElement('span');
+    const ok=typeof qtyOnHand==='number' && wanted<=qtyOnHand;
+    el.className='pill ' + (ok?'green':'red');
+    el.textContent=typeof qtyOnHand==='number'?`${qtyOnHand} in stock`:'No stock tracking';
+    return el;
+  }
+  function reflectAvailability(){
+    hint.innerHTML='';
+    if(!selected) return;
+    const wanted = Math.max(1, Math.floor(Number(qtyEl.value||1)));
+    hint.appendChild(stockPill(selected.qtyOnHand, wanted));
+  }
+
+  function tryAlias(){
+    const key = input.value.trim().toLowerCase();
+    const id = (JSON.parse(localStorage.getItem('fastorder_aliases_v1')||'{}'))[key];
+    if(!id) return false;
+    search(input.value).then(items=>{
+      const match = items.find(i => String(i.id)===String(id)) || items[0];
+      if(match){ choose(match); }
+    });
+    return true;
+  }
+
+  async function search(q){
+    const r=await fetch(API + '/api/items?q='+encodeURIComponent(q||''));
+    if(!r.ok) return [];
+    const d=await r.json();
+    return d.items||[];
+  }
+
+  function renderList(items){
+    panel.innerHTML=''; if(!items.length){ panel.style.display='none'; return; }
+    items.slice(0,20).forEach(p=>{
+      const d=document.createElement('div');
+      d.className='item';
+      d.innerHTML='<strong>'+escapeHtml(stripPrefix(p.name))+'</strong>'+(p.sku?' <span class="meta">SKU '+escapeHtml(p.sku)+'</span>':'')+(p.unitPrice!=null?' <span class="meta">£'+Number(p.unitPrice).toFixed(2)+'</span>':'');
+      d.onclick=()=>{ choose(p); panel.style.display='none'; };
+      panel.appendChild(d);
+    });
+    panel.style.display='block';
+  }
+
+  function choose(p){
+    selected=p;
+    input.value=p.name;
+    priceEl.value=(p.unitPrice!=null?Number(p.unitPrice).toFixed(2):'');
+    reflectAvailability();
+  }
+
+  async function update(){ renderList(await search(input.value)); }
+
+  input.addEventListener('focus', ()=> { if(!tryAlias()) update(); });
+  input.addEventListener('input', update);
+  document.addEventListener('click', (e)=>{ if(!panel.contains(e.target) && e.target!==input){ panel.style.display='none'; } });
+  qtyEl.addEventListener('input', ()=>{ const n=Math.max(1,Math.floor(Number(qtyEl.value||1))); qtyEl.value=String(n); reflectAvailability(); });
+
+  lineEl.querySelector('.remove').onclick = (e)=>{ e.preventDefault(); lineEl.remove(); };
+  lineEl.querySelector('.teach').onclick = (e)=>{
+    e.preventDefault();
+    if(!selected){ alert('Pick a product from the dropdown first, then click Teach.'); return; }
+    const key = input.value.trim().toLowerCase();
+    const map = JSON.parse(localStorage.getItem('fastorder_aliases_v1')||'{}');
+    map[key] = selected.id;
+    localStorage.setItem('fastorder_aliases_v1', JSON.stringify(map));
+    alert('Taught: "'+key+'" → '+selected.name);
+  };
+
+  lineEl.getValue = () => ({
+    itemId: selected?.id,
+    description: selected?.name || input.value,
+    qty: Math.max(1, Math.floor(Number(qtyEl.value||1))),
+    unitPrice: Number(priceEl.value || 0)
+  });
+}
+
+// parse
+document.getElementById('parseBtn').onclick = ()=>{
+  const txt = document.getElementById('paste').value || '';
+  const parts = parseLines(txt);
+  const holder = document.getElementById('lines');
+  holder.innerHTML='';
+  parts.forEach(p => holder.appendChild(newLineRow(p)));
+  document.getElementById('linesCard').style.display = parts.length ? 'block' : 'none';
+};
+document.getElementById('clearBtn').onclick = ()=>{
+  document.getElementById('paste').value='';
+  document.getElementById('lines').innerHTML='';
+  document.getElementById('linesCard').style.display='none';
+};
+
+// remember agent
+document.getElementById('agentName').addEventListener('change', ()=>{
+  const s = JSON.parse(localStorage.getItem('fastorder_settings_v1')||'{}');
+  s.agentName = document.getElementById('agentName').value.trim();
+  localStorage.setItem('fastorder_settings_v1', JSON.stringify(s));
+});
+
+// export/import teaches
+document.getElementById('exportAliases').onclick = ()=>{
+  const blob = new Blob([localStorage.getItem('fastorder_aliases_v1')||'{}'], {type: 'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'fastorder-aliases.json'; a.click();
+};
+document.getElementById('importAliases').onclick = ()=> document.getElementById('importFile').click();
+document.getElementById('importFile').addEventListener('change', (e)=>{
+  const f=e.target.files[0]; if(!f) return;
+  const rd=new FileReader();
+  rd.onload=()=>{ try{ localStorage.setItem('fastorder_aliases_v1', rd.result); alert('Aliases imported.'); }catch{ alert('Invalid file.'); } };
+  rd.readAsText(f);
+});
+
+// submit
+document.getElementById('submitBtn').onclick = async ()=>{
+  const status=document.getElementById('status');
+  status.textContent='Submitting…';
+  const customerId=(document.getElementById('customerId').value||'').trim();
+  if(!customerId){ alert('Pick a customer once (QuickBooks requires it).'); status.textContent=''; return; }
+
+  const s = JSON.parse(localStorage.getItem('fastorder_settings_v1')||'{}');
+  const agentName=s.agentName||'';
+  const notes=document.getElementById('notes').value.trim();
+  const draftType=document.getElementById('draftType').value;
+
+  const lines=Array.from(document.querySelectorAll('#lines .line')).map(el=>el.getValue()).filter(l=>l.itemId && l.qty>=1);
+  if(!lines.length){ alert('Add at least one product line.'); status.textContent=''; return; }
+
+  const endpoint=draftType==='estimate'?'/api/estimate':'/api/invoice';
+  const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customerId,notes,agentName,lines})});
+  const data=await res.json();
+  if(res.ok){ status.textContent=draftType==='estimate'?`Estimate created ✓ (ID ${data.estimate.Id||data.estimate.id})`:`Invoice created (unsent) ✓ (ID ${data.invoice.Id||data.invoice.id})`; }
+  else{ alert('Error: '+(data.error||'Unknown')); status.textContent='Error'; console.error(data); }
+};
+</script>
+</body>
+</html>
